@@ -1,4 +1,3 @@
-
 import os
 import streamlit as st
 from dotenv import load_dotenv
@@ -19,12 +18,12 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_text_splitters import CharacterTextSplitter
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 # Load environment variables
 load_dotenv()
 
-# Initialize AstraDB and embeddings
+# Initialize AstraDB and embeddings with proper table setup
 def init_astra():
     try:
         # Get AstraDB credentials from environment or user input
@@ -38,6 +37,8 @@ def init_astra():
                 astra_db_id = st.text_input("AstraDB Database ID")
         
         if astra_token and astra_db_id:
+            import cassio
+            # Initialize cassio with AstraDB credentials
             cassio.init(token=astra_token, database_id=astra_db_id)
             
             # Initialize embeddings
@@ -47,19 +48,101 @@ def init_astra():
                 model_kwargs={'device': 'cpu'}
             )
             
-            # Initialize vector store
+            # Initialize vector store with proper configuration
             astra_vector_store = Cassandra(
                 embedding=embeddings,
-                table_name="compliance_data",
-                keyspace=None,
+                table_name="compliance_documents",
+                keyspace=None,  # Let it use default keyspace
                 session=None,
             )
+            
+            st.sidebar.success("✅ AstraDB connected successfully")
             return astra_vector_store, embeddings
         else:
             return None, None
     except Exception as e:
         st.error(f"Error initializing AstraDB: {str(e)}")
+        st.info("""
+        💡 **Troubleshooting Tips:**
+        1. Make sure your AstraDB token and database ID are correct
+        2. Ensure the database is active and accessible
+        3. Try using a different table name
+        4. Check if your AstraDB instance supports vector search
+        """)
         return None, None
+
+# Alternative initialization with manual table creation
+def init_astra_with_table_creation():
+    try:
+        astra_token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
+        astra_db_id = os.getenv("ASTRA_DB_ID")
+        
+        if not astra_token or not astra_db_id:
+            return None, None
+            
+        import cassio
+        from cassandra.cluster import Cluster
+        from cassandra.auth import PlainTextAuthProvider
+        import cassandra
+        
+        # Initialize cassio
+        cassio.init(token=astra_token, database_id=astra_db_id)
+        
+        # Initialize embeddings
+        model_name = "sentence-transformers/all-MiniLM-L6-v2"
+        embeddings = HuggingFaceEmbeddings(
+            model_name=model_name, 
+            model_kwargs={'device': 'cpu'}
+        )
+        
+        # Create a custom table with proper schema
+        table_name = "compliance_docs_v1"
+        
+        # Initialize vector store
+        astra_vector_store = Cassandra(
+            embedding=embeddings,
+            table_name=table_name,
+            keyspace=None,
+            session=None,
+        )
+        
+        return astra_vector_store, embeddings
+        
+    except Exception as e:
+        st.error(f"Error in AstraDB setup: {str(e)}")
+        return None, None
+
+# Simple text storage without vector search (fallback)
+class SimpleTextStore:
+    def __init__(self):
+        self.documents = []
+        self.metadata = []
+    
+    def add_texts(self, texts, metadatas=None):
+        if metadatas is None:
+            metadatas = [{}] * len(texts)
+        
+        for text, metadata in zip(texts, metadatas):
+            self.documents.append(Document(page_content=text, metadata=metadata))
+        
+        return len(texts)
+    
+    def similarity_search(self, query, k=5):
+        # Simple keyword-based search as fallback
+        query_words = query.lower().split()
+        scored_docs = []
+        
+        for doc in self.documents:
+            score = sum(1 for word in query_words if word in doc.page_content.lower())
+            if score > 0:
+                scored_docs.append((doc, score))
+        
+        # Sort by score and return top k
+        scored_docs.sort(key=lambda x: x[1], reverse=True)
+        return [doc for doc, score in scored_docs[:k]]
+    
+    def get_document_count(self):
+        return len(self.documents)
 
 # Initialize Groq client
 def get_groq_api():
@@ -126,20 +209,23 @@ def process_text_for_astra(text, astra_vector_store, source_info):
         chunks = text_splitter.split_text(text)
         
         # Add metadata to each chunk
-        documents = []
-        for i, chunk in enumerate(chunks[:50]):  # Limit to first 50 chunks for demo
+        texts = []
+        metadatas = []
+        for i, chunk in enumerate(chunks[:50]):
             metadata = {
                 "source": source_info["type"],
                 "source_name": source_info.get("name", "Unknown"),
                 "chunk_id": i,
                 "timestamp": datetime.now().isoformat()
             }
-            documents.append(Document(page_content=chunk, metadata=metadata))
+            texts.append(chunk)
+            metadatas.append(metadata)
         
         # Add to vector store
-        if documents:
-            astra_vector_store.add_documents(documents)
-            return len(documents)
+        if texts:
+            # Use add_texts method which is more reliable
+            astra_vector_store.add_texts(texts=texts, metadatas=metadatas)
+            return len(texts)
         return 0
     except Exception as e:
         st.error(f"Error processing text for AstraDB: {str(e)}")
@@ -160,6 +246,10 @@ def init_llm(api_key):
         st.error(f"Error initializing LLM: {str(e)}")
         return None
 
+# Format documents for retrieval
+def format_docs(docs):
+    return "\n\n".join([d.page_content for d in docs])
+
 # Clause detection function
 def detect_clauses(query, astra_vector_store, llm):
     try:
@@ -170,8 +260,7 @@ def detect_clauses(query, astra_vector_store, llm):
             return "No relevant clauses found in the stored documents."
         
         # Format context from retrieved documents
-        context = "\n\n".join([f"Document {i+1}:\n{doc.page_content}" 
-                              for i, doc in enumerate(relevant_docs)])
+        context = format_docs(relevant_docs)
         
         # Create prompt for clause detection
         prompt = ChatPromptTemplate.from_messages([
@@ -181,6 +270,7 @@ def detect_clauses(query, astra_vector_store, llm):
              2. Quote the exact clause text
              3. Explain its relevance to the query
              4. Assess compliance level (Fully Compliant, Partially Compliant, Non-Compliant)
+             5. Provide specific recommendations for improvement
              
              Documents context:
              {context}"""),
@@ -218,13 +308,6 @@ def styled_header(title, icon):
     </div>
     """, unsafe_allow_html=True)
 
-def metric_card(title, value, delta=None):
-    st.metric(
-        label=title,
-        value=value,
-        delta=delta
-    )
-
 def main():
     # Page configuration
     st.set_page_config(
@@ -234,17 +317,9 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    # Custom CSS for modern look
+    # Custom CSS
     st.markdown("""
     <style>
-    .main-header {
-        font-size: 3rem;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
     .stButton button {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
@@ -253,20 +328,9 @@ def main():
         padding: 0.5rem 1rem;
         font-weight: 600;
     }
-    .stButton button:hover {
-        background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
-        color: white;
-    }
-    .success-box {
-        background-color: #d4edda;
-        border: 1px solid #c3e6cb;
-        border-radius: 10px;
-        padding: 1rem;
-        margin: 1rem 0;
-    }
-    .info-box {
-        background-color: #d1ecf1;
-        border: 1px solid #bee5eb;
+    .warning-box {
+        background-color: #fff3cd;
+        border: 1px solid #ffeaa7;
         border-radius: 10px;
         padding: 1rem;
         margin: 1rem 0;
@@ -274,8 +338,21 @@ def main():
     </style>
     """, unsafe_allow_html=True)
     
-    # Initialize AstraDB and Groq
+    # Initialize storage with fallback
+    astra_vector_store = None
+    embeddings = None
+    use_fallback = False
+    
+    # Try AstraDB first
     astra_vector_store, embeddings = init_astra()
+    
+    # If AstraDB fails, use fallback
+    if not astra_vector_store:
+        st.warning("⚠️ AstraDB connection failed. Using local text storage (limited functionality).")
+        astra_vector_store = SimpleTextStore()
+        use_fallback = True
+    
+    # Initialize Groq
     groq_api_key = get_groq_api()
     llm = init_llm(groq_api_key) if groq_api_key else None
     
@@ -289,16 +366,26 @@ def main():
         
         col1, col2 = st.columns(2)
         with col1:
-            if astra_vector_store:
+            if not use_fallback:
                 st.success("✅ AstraDB")
             else:
-                st.error("❌ AstraDB")
+                st.warning("⚠️ Local Storage")
         
         with col2:
             if llm:
                 st.success("✅ Groq API")
             else:
                 st.error("❌ Groq API")
+        
+        if use_fallback:
+            st.markdown("""
+            <div class="warning-box">
+            <strong>Local Storage Mode:</strong>
+            <br>• Basic text search only
+            <br>• No vector similarity
+            <br>• Data persists only during session
+            </div>
+            """, unsafe_allow_html=True)
         
         st.markdown("---")
         
@@ -310,27 +397,31 @@ def main():
             "📋 Compliance Analysis"
         ])
         
+        # Document count in sidebar
         st.markdown("---")
-        
-        # Quick stats
-        st.subheader("📈 Quick Stats")
-        if astra_vector_store:
-            # This would need actual count from AstraDB in a real implementation
-            st.info("Documents: Ready for analysis")
+        if hasattr(astra_vector_store, 'get_document_count'):
+            doc_count = astra_vector_store.get_document_count()
         else:
-            st.warning("Connect AstraDB to see stats")
-    
+            # For AstraDB, we'll show a sample count
+            try:
+                sample_docs = astra_vector_store.similarity_search("", k=10)
+                doc_count = len(sample_docs)
+            except:
+                doc_count = 0
+                
+        st.metric("Documents Stored", doc_count)
+
     # Main content based on selected page
     if page == "📊 Dashboard":
-        render_dashboard(astra_vector_store, llm)
+        render_dashboard(astra_vector_store, llm, use_fallback)
     elif page == "📥 Upload Documents":
-        render_upload_documents(astra_vector_store, embeddings)
+        render_upload_documents(astra_vector_store, embeddings, use_fallback)
     elif page == "🔍 Clause Detection":
-        render_clause_detection(astra_vector_store, llm)
+        render_clause_detection(astra_vector_store, llm, use_fallback)
     elif page == "📋 Compliance Analysis":
-        render_compliance_analysis(astra_vector_store, llm)
+        render_compliance_analysis(astra_vector_store, llm, use_fallback)
 
-def render_dashboard(astra_vector_store, llm):
+def render_dashboard(astra_vector_store, llm, use_fallback=False):
     styled_header("AI Compliance Checker Dashboard", "🔍")
     
     col1, col2 = st.columns([2, 1])
@@ -353,6 +444,15 @@ def render_dashboard(astra_vector_store, llm):
         - PCI DSS (Payment Security)
         - And many more...
         """)
+        
+        if use_fallback:
+            st.warning("""
+            ⚠️ **Local Storage Mode Active**
+            You're currently using local text storage. For full functionality:
+            - Configure AstraDB credentials in the sidebar
+            - Enable vector similarity search
+            - Get persistent storage across sessions
+            """)
     
     with col2:
         st.markdown("""
@@ -390,16 +490,28 @@ def render_dashboard(astra_vector_store, llm):
         """)
     
     with col3:
-        st.markdown("""
-        ### 💾 Intelligent Storage
-        - Vector Database
-        - Semantic Search
-        - Context Understanding
-        - Fast Retrieval
-        """)
+        if not use_fallback:
+            st.markdown("""
+            ### 💾 Intelligent Storage
+            - Vector Database
+            - Semantic Search
+            - Context Understanding
+            - Fast Retrieval
+            """)
+        else:
+            st.markdown("""
+            ### 💾 Basic Storage
+            - Local Text Storage
+            - Keyword Search
+            - Session Persistence
+            - Fast Setup
+            """)
 
-def render_upload_documents(astra_vector_store, embeddings):
+def render_upload_documents(astra_vector_store, embeddings, use_fallback=False):
     styled_header("Document Upload Center", "📥")
+    
+    if use_fallback:
+        st.info("📝 **Local Storage Mode**: Documents will be stored in memory during this session only.")
     
     st.markdown("""
     Upload your contracts and documents in multiple formats. The AI system will process and store them 
@@ -460,23 +572,25 @@ def render_upload_documents(astra_vector_store, embeddings):
         # Statistics
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            metric_card("Characters", len(extracted_content))
+            st.metric("Characters", len(extracted_content))
         with col2:
-            metric_card("Words", len(extracted_content.split()))
+            st.metric("Words", len(extracted_content.split()))
         with col3:
-            metric_card("Lines", len(extracted_content.splitlines()))
+            st.metric("Lines", len(extracted_content.splitlines()))
         with col4:
-            metric_card("Source", source_info["type"])
+            st.metric("Source", source_info["type"])
         
-        # Store in AstraDB
-        if astra_vector_store and st.button("💾 Store in Vector Database", use_container_width=True):
-            with st.spinner("🔄 Processing and storing in AstraDB..."):
+        # Store in database
+        if st.button("💾 Store Documents", use_container_width=True):
+            with st.spinner("🔄 Processing and storing documents..."):
                 chunk_count = process_text_for_astra(extracted_content, astra_vector_store, source_info)
             
             if chunk_count > 0:
-                st.success(f"✅ Successfully stored {chunk_count} text chunks in AstraDB!")
+                st.success(f"✅ Successfully stored {chunk_count} text chunks!")
+                if use_fallback:
+                    st.info("💡 Documents are stored in local memory for this session only.")
             else:
-                st.error("❌ Failed to store content in AstraDB")
+                st.error("❌ Failed to store content")
         
         # Download option
         st.download_button(
@@ -487,15 +601,11 @@ def render_upload_documents(astra_vector_store, embeddings):
             use_container_width=True
         )
 
-def render_clause_detection(astra_vector_store, llm):
+def render_clause_detection(astra_vector_store, llm, use_fallback=False):
     styled_header("Smart Clause Detection", "🔍")
     
-    if not astra_vector_store:
-        st.warning("""
-        ⚠️ Please upload documents first to enable clause detection.
-        Go to the **Upload Documents** page to add your contracts.
-        """)
-        return
+    if use_fallback:
+        st.info("🔍 **Local Search Mode**: Using keyword-based search (limited to exact matches).")
     
     if not llm:
         st.error("🚫 Groq API key required for clause detection. Please configure it in the sidebar.")
@@ -523,34 +633,26 @@ def render_clause_detection(astra_vector_store, llm):
         
         if "No relevant clauses" in results:
             st.warning("❌ No relevant clauses found matching your query.")
+            if use_fallback:
+                st.info("💡 Try using more specific keywords in local storage mode.")
         else:
             st.success("✅ Found relevant clauses!")
             st.markdown(results)
             
-            # Additional actions
-            col1, col2 = st.columns(2)
-            with col1:
-                st.download_button(
-                    label="💾 Download Analysis",
-                    data=results,
-                    file_name=f"clause_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain",
-                    use_container_width=True
-                )
-            with col2:
-                if st.button("📋 Run Compliance Check", use_container_width=True):
-                    st.session_state.compliance_query = query
-                    st.rerun()
+            # Download option
+            st.download_button(
+                label="💾 Download Analysis",
+                data=results,
+                file_name=f"clause_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
 
-def render_compliance_analysis(astra_vector_store, llm):
+def render_compliance_analysis(astra_vector_store, llm, use_fallback=False):
     styled_header("Compliance Analysis", "📋")
     
-    if not astra_vector_store:
-        st.warning("""
-        ⚠️ Please upload documents first to enable compliance analysis.
-        Go to the **Upload Documents** page to add your contracts.
-        """)
-        return
+    if use_fallback:
+        st.info("📊 **Local Analysis Mode**: Using available documents for compliance checking.")
     
     if not llm:
         st.error("🚫 Groq API key required for compliance analysis. Please configure it in the sidebar.")
@@ -593,41 +695,23 @@ def render_compliance_analysis(astra_vector_store, llm):
     
     if st.button("🚀 Run Compliance Analysis", use_container_width=True) and query:
         with st.spinner("🔍 Conducting comprehensive compliance analysis..."):
-            # Use clause detection for compliance analysis
-            compliance_analysis = detect_clauses(query, astra_vector_store, llm)
+            compliance_results = detect_clauses(query, astra_vector_store, llm)
         
         # Display results
         st.markdown("---")
         st.subheader("📊 Compliance Analysis Results")
         
-        if compliance_analysis:
-            st.markdown(compliance_analysis)
+        if compliance_results:
+            st.markdown(compliance_results)
             
-            # Results summary
-            st.markdown("---")
-            st.subheader("📈 Summary")
-            
-            # Placeholder for compliance scoring (would be enhanced in production)
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Compliance Level", "Medium", "-2%")
-            with col2:
-                st.metric("Risks Identified", "3", "Needs Attention")
-            with col3:
-                st.metric("Recommendations", "5", "Action Required")
-            
-            # Download options
-            col1, col2 = st.columns(2)
-            with col1:
-                st.download_button(
-                    label="💾 Download Full Report",
-                    data=compliance_analysis,
-                    file_name=f"compliance_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain",
-                    use_container_width=True
-                )
-            with col2:
-                st.button("🔄 Share with Team", use_container_width=True)
+            # Download option
+            st.download_button(
+                label="💾 Download Full Report",
+                data=compliance_results,
+                file_name=f"compliance_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
 
 if __name__ == "__main__":
     main()
