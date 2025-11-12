@@ -467,29 +467,29 @@ def main():
 
         st.markdown("---")
         contract_count = len(st.session_state.contract_storage.get_all_contracts())
+        
+        feedback = st.text_area("💬 Feedback", placeholder="Share your feedback...", height=80)
+        if st.button("Submit Feedback", use_container_width=True):
+            if feedback.strip():
+                st.success("✅ Thank you for your feedback!")
+        else:
+            st.warning("⚠️ Please enter your feedback")
 
         col1, col2 = st.columns(2)
         with col1:
-            feedback = st.text_area("💬 Feedback", placeholder="Share your feedback...", height=80)
-            if st.button("Submit Feedback", use_container_width=True):
-                if feedback.strip():
-                    st.success("✅ Thank you for your feedback!")
-            else:
-                st.warning("⚠️ Please enter your feedback")
-
-        with col2:
             st.metric("Contracts", contract_count)
 
-        if contract_count > 0:
-            st.subheader("📋 Stored Contracts")
-            contracts = st.session_state.contract_storage.get_all_contracts()
-            for contract_id, contract_data in contracts.items():
-                st.markdown(f"""
-                <div class="contract-card">
-                <strong>{contract_data['name']}</strong><br>
-                <small>Uploaded: {contract_data['upload_time'][:16]}</small>
-                </div>
-                """, unsafe_allow_html=True)
+        with col2:
+          if contract_count > 0:
+              st.subheader("📋 Stored Contracts")
+              contracts = st.session_state.contract_storage.get_all_contracts()
+              for contract_id, contract_data in contracts.items():
+                  st.markdown(f"""
+                  <div class="contract-card">
+                  <strong>{contract_data['name']}</strong><br>
+                  <small>Uploaded: {contract_data['upload_time'][:16]}</small>
+                  </div>
+                  """, unsafe_allow_html=True)
 
     if page == "🏠 Dashboard":
         render_dashboard(astra_vector_store, llm)
@@ -499,13 +499,12 @@ def main():
         render_upload_analyze_contracts(astra_vector_store, llm)
 
 def render_dashboard(astra_vector_store, llm):
-    styled_header("AI Compliance Analyzer Pro", "🏠")
+    styled_header("AI Powered Compliance Analyzer", "🏠")
 
     col1, col2 = st.columns([2, 1])
 
     with col1:
         st.markdown("""
-        ### 🚀 Welcome to AI-Powered Regulatory Compliance Analyzer Pro
 
         **🎯 Advanced Workflow:**
         1. **Upload Compliance Docs** - Store regulatory frameworks in AstraDB
@@ -531,7 +530,6 @@ def render_dashboard(astra_vector_store, llm):
 
     with col2:
         st.markdown("""
-        ### 📋 Smart Analysis Pipeline
 
         🔍 **Comprehensive Analysis**
         - Single-step complete analysis
@@ -652,29 +650,8 @@ def render_upload_compliance(astra_vector_store, embeddings):
                 """, unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader("📊 Stored Compliance Documents")
 
-    # try:
-    #     sample_docs = astra_vector_store.similarity_search("compliance", k=10)
-    #     if sample_docs:
-    #         st.markdown(f"""
-    #         <div class="success-box">
-    #         ✅ {len(sample_docs)} compliance documents available in AstraDB
-    #         </div>
-    #         """, unsafe_allow_html=True)
-    #     else:
-    #         st.markdown("""
-    #         <div class="info-box">
-    #         ℹ️ No compliance documents stored yet. Upload compliance frameworks to get started.
-    #         </div>
-    #         """, unsafe_allow_html=True)
-    except Exception as e:
-        st.markdown("""
-        <div class="info-box">
-        ℹ️ No compliance documents stored yet. Upload compliance frameworks to get started.
-        </div>
-        """, unsafe_allow_html=True)
-
+    
 def render_upload_analyze_contracts(astra_vector_store, llm):
     styled_header("Upload & Analyze Contracts", "📄")
 
@@ -925,14 +902,9 @@ Frameworks: {', '.join(regulatory_focus)}
 Contract Length: {len(contract_text)} characters
 
 ANALYSIS RESULTS:
+
 {analysis_result}
 
-ANALYSIS METHODOLOGY:
-- Single-step comprehensive analysis
-- Full contract text processing
-- Smart compliance document retrieval
-- Complete risk assessment
-- Rectified clause suggestions
                 """
 
                 st.download_button(
