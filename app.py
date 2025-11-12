@@ -26,7 +26,6 @@ load_dotenv()
 # Initialize AstraDB and embeddings with proper table setup
 def init_astra():
     try:
-        # Get AstraDB credentials from environment or user input
         astra_token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
         astra_db_id = os.getenv("ASTRA_DB_ID")
 
@@ -38,21 +37,18 @@ def init_astra():
 
         if astra_token and astra_db_id:
             import cassio
-            # Initialize cassio with AstraDB credentials
             cassio.init(token=astra_token, database_id=astra_db_id)
 
-            # Initialize embeddings
             model_name = "sentence-transformers/all-MiniLM-L6-v2"
             embeddings = HuggingFaceEmbeddings(
                 model_name=model_name,
                 model_kwargs={'device': 'cpu'}
             )
 
-            # Initialize vector store with proper configuration
             astra_vector_store = Cassandra(
                 embedding=embeddings,
                 table_name="compliance_documents",
-                keyspace=None,  # Let it use default keyspace
+                keyspace=None,
                 session=None,
             )
 
@@ -101,7 +97,6 @@ def extract_from_url(url):
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Remove script and style elements
         for script in soup(["script", "style"]):
             script.decompose()
 
@@ -125,7 +120,6 @@ def extract_from_txt(file):
 # Process and chunk text
 def process_text_for_astra(text, astra_vector_store, source_info, doc_type="compliance"):
     try:
-        # Split text into chunks
         text_splitter = CharacterTextSplitter(
             separator="\n",
             chunk_size=400,
@@ -135,23 +129,20 @@ def process_text_for_astra(text, astra_vector_store, source_info, doc_type="comp
 
         chunks = text_splitter.split_text(text)
 
-        # Add metadata to each chunk
         texts = []
         metadatas = []
         for i, chunk in enumerate(chunks[:50]):
             metadata = {
                 "source": source_info["type"],
                 "source_name": source_info.get("name", "Unknown"),
-                "doc_type": doc_type,  # "compliance" or "contract"
+                "doc_type": doc_type,
                 "chunk_id": i,
                 "timestamp": datetime.now().isoformat()
             }
             texts.append(chunk)
             metadatas.append(metadata)
 
-        # Add to vector store
         if texts:
-            # Use add_texts method which is more reliable
             astra_vector_store.add_texts(texts=texts, metadatas=metadatas)
             return len(texts)
         return 0
@@ -166,8 +157,8 @@ def init_llm(api_key):
             openai_api_key=api_key,
             openai_api_base="https://api.groq.com/openai/v1",
             model="llama-3.3-70b-versatile",
-            temperature=0.1,  # Lower temperature for more precise responses
-            max_tokens=4000
+            temperature=0.1,
+            max_tokens=8000
         )
         return llm
     except Exception as e:
@@ -178,170 +169,97 @@ def init_llm(api_key):
 def format_docs(docs):
     return "\n\n".join([d.page_content for d in docs])
 
-# Extract key clauses and compliance keywords from contract
-def extract_clauses_and_keywords(contract_text, llm):
+# Retrieve relevant compliance documents using smart search
+def retrieve_compliance_docs(contract_text, astra_vector_store, regulatory_focus):
     try:
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a legal expert specializing in contract analysis. Extract ALL key clauses and compliance-relevant keywords from the contract.
-
-            RETURN EXACTLY IN THIS FORMAT:
-            
-            KEY CLAUSES:
-            1. [Clause Name]: [Exact clause text or precise description]
-            2. [Clause Name]: [Exact clause text or precise description]
-            
-            COMPLIANCE KEYWORDS:
-            [Keyword1], [Keyword2], [Keyword3], [Keyword4], [Keyword5], [Keyword6]
-            
-            Be extremely precise and comprehensive. Include ALL relevant clauses related to: data protection, privacy, security, liability, termination, payment, intellectual property, confidentiality, warranties, indemnification, governing law, dispute resolution."""),
-            ("human", "Contract Text:\n{contract_text}")
-        ])
-
-        extraction_chain = prompt | llm | StrOutputParser()
-        result = extraction_chain.invoke({"contract_text": contract_text[:6000]})  # Limit text length
-        
-        # Parse the result
-        clauses_section = ""
-        keywords_section = ""
-        
-        if "KEY CLAUSES:" in result and "COMPLIANCE KEYWORDS:" in result:
-            parts = result.split("COMPLIANCE KEYWORDS:")
-            clauses_section = parts[0].replace("KEY CLAUSES:", "").strip()
-            keywords_section = parts[1].strip()
-        elif "KEY CLAUSES:" in result:
-            clauses_section = result.replace("KEY CLAUSES:", "").strip()
-        else:
-            clauses_section = result.strip()
-            
-        # Extract keywords from keywords section
-        if keywords_section:
-            keywords = [kw.strip() for kw in keywords_section.split(',') if kw.strip()]
-        else:
-            # Fallback: extract from clauses
-            keywords = extract_fallback_keywords(clauses_section)
-        
-        return clauses_section, keywords[:8]  # Return top 8 keywords
-        
-    except Exception as e:
-        return f"Error extracting clauses: {str(e)}", ["data protection", "privacy", "security", "compliance"]
-
-def extract_fallback_keywords(clauses_text):
-    """Extract keywords from clauses text as fallback"""
-    important_keywords = [
-        "data protection", "privacy", "security", "gdpr", "hipaa", 
-        "confidentiality", "liability", "indemnification", "warranty",
-        "termination", "governing law", "dispute", "intellectual property",
-        "payment", "breach", "compliance"
-    ]
-    
-    found_keywords = []
-    clauses_lower = clauses_text.lower()
-    
-    for keyword in important_keywords:
-        if keyword in clauses_lower:
-            found_keywords.append(keyword)
-    
-    return found_keywords[:6] if found_keywords else ["data protection", "privacy", "security", "compliance"]
-
-# Retrieve relevant compliance documents using extracted keywords
-def retrieve_compliance_docs(keywords, astra_vector_store, llm):
-    try:
-        # Create optimized search queries from keywords
         search_queries = []
-        for keyword in keywords:
-            # Enhance basic keywords with context
-            enhanced_queries = [
-                f"{keyword} requirements compliance",
-                f"regulatory {keyword} standards",
-                f"{keyword} legal obligations",
-                f"{keyword} best practices"
-            ]
-            search_queries.extend(enhanced_queries)
         
-        # Search for relevant documents
+        base_keywords = [
+            "data protection", "privacy", "security", "confidentiality", 
+            "liability", "indemnification", "warranty", "termination",
+            "governing law", "intellectual property", "breach", "compliance"
+        ]
+        
+        regulatory_queries = []
+        for framework in regulatory_focus:
+            if "GDPR" in framework:
+                regulatory_queries.extend(["GDPR data protection", "personal data processing", "data subject rights"])
+            if "HIPAA" in framework:
+                regulatory_queries.extend(["HIPAA healthcare privacy", "protected health information", "PHI security"])
+            if "SOX" in framework:
+                regulatory_queries.extend(["SOX financial controls", "internal controls", "financial reporting"])
+            if "CCPA" in framework:
+                regulatory_queries.extend(["CCPA consumer privacy", "California privacy", "consumer rights"])
+            if "PCI" in framework:
+                regulatory_queries.extend(["PCI DSS security", "payment card security", "cardholder data"])
+        
+        all_queries = base_keywords + regulatory_queries
+        
         all_docs = []
-        for query in search_queries[:12]:  # Limit number of queries
+        for query in all_queries[:15]:
             try:
-                docs = astra_vector_store.similarity_search(query, k=2)
+                docs = astra_vector_store.similarity_search(query, k=3)
                 all_docs.extend(docs)
             except Exception as e:
                 continue
-        
-        # Remove duplicates
+
         unique_docs = []
         seen_content = set()
         for doc in all_docs:
-            content_hash = hash(doc.page_content[:100])  # Hash first 100 chars to identify duplicates
+            content_hash = hash(doc.page_content[:100])
             if content_hash not in seen_content:
                 unique_docs.append(doc)
                 seen_content.add(content_hash)
-        
-        return unique_docs[:10]  # Return top 10 unique documents
-        
+
+        return unique_docs[:15]
+
     except Exception as e:
         st.error(f"Error retrieving compliance documents: {str(e)}")
         return []
 
-# Perform comprehensive compliance analysis
-def analyze_compliance_comprehensive(contract_text, clauses_text, compliance_docs, llm, regulatory_focus):
+# Single comprehensive compliance analysis function
+def comprehensive_compliance_analysis(contract_text, compliance_docs, llm, regulatory_focus):
     try:
-        # Format compliance context
         compliance_context = format_docs(compliance_docs) if compliance_docs else "No specific compliance documents retrieved from database."
-        
-        regulatory_context = ", ".join(regulatory_focus)
-        
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""You are a senior compliance analyst. Analyze the contract clauses against compliance requirements and provide a PRECISE assessment.
 
-            **COMPLIANCE REQUIREMENTS FROM DATABASE:**
+        regulatory_context = ", ".join(regulatory_focus)
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", f"""You are a senior compliance analyst and legal expert. Perform a COMPREHENSIVE analysis of the contract against compliance requirements.
+
+            COMPLIANCE REQUIREMENTS FROM DATABASE:
             {compliance_context}
 
-            **ANALYSIS INSTRUCTIONS:**
-            1. Compare EACH key clause against relevant compliance requirements
-            2. Identify ONLY actual compliance issues - if no issues, say so
-            3. Be specific and reference exact requirements
-            4. Omit sections that have no content
+            REGULATORY FOCUS:
+            {regulatory_context}
 
-            **RETURN EXACTLY IN THIS FORMAT:**
+            ANALYSIS INSTRUCTIONS:
+            Perform a complete analysis in the following structured format:
 
-            **KEY CLAUSES IDENTIFIED:**
-            [List the key clauses exactly as provided]
+            1. KEY CLAUSES IDENTIFIED: list all important clauses from the contract
+            2. SPECIFIC ISSUES & VIOLATIONS: List exact compliance violations with references
+            3. RECTIFIED CLAUSE SUGGESTIONS: Provide corrected versions of problematic clauses
+            4. Parties detail: Like full legal names,addresses, contact information etc
 
-            **COMPLIANCE ISSUES:**
-            [ONLY if issues exist, list specific compliance violations with exact references to requirements]
-            [If NO issues found, write: "No significant compliance issues identified."]
-
-            **RISKS:**
-            [ONLY if risks exist, list specific risks with severity levels]
-            [If NO risks found, write: "No significant compliance risks identified."]
-
-            **RECOMMENDATIONS:**
-            [ONLY if improvements needed, provide specific actionable recommendations]
-            [If NO improvements needed, write: "Contract appears compliant with current requirements."]
-
-            Focus that matched contract: {regulatory_context}"""),
-            ("human", """CONTRACT CLAUSES FOR ANALYSIS:
-{clauses_text}
-
-FULL CONTRACT TEXT (for reference):
-{contract_text}""")
+            Be thorough, precise, and reference exact compliance requirements from the database.
+            """),
+            ("human", """Contract:\n{contract_text}""")
         ])
 
         analysis_chain = prompt | llm | StrOutputParser()
         return analysis_chain.invoke({
-            "clauses_text": clauses_text,
-            "contract_text": contract_text[:3000]  # Limit full text for context
+            "contract_text": contract_text
         })
-        
+
     except Exception as e:
-        return f"Error in compliance analysis: {str(e)}"
+        return f"Error in comprehensive compliance analysis: {str(e)}"
 
 # Local storage management for contracts
 class ContractStorage:
     def __init__(self):
         self.contracts = {}
         self.next_id = 1
-        
+
     def save_contract(self, contract_text, source_info):
         contract_id = f"contract_{self.next_id}"
         self.contracts[contract_id] = {
@@ -353,13 +271,13 @@ class ContractStorage:
         }
         self.next_id += 1
         return contract_id
-        
+
     def get_contract(self, contract_id):
         return self.contracts.get(contract_id)
-        
+
     def get_all_contracts(self):
         return self.contracts
-        
+
     def delete_contract(self, contract_id):
         if contract_id in self.contracts:
             del self.contracts[contract_id]
@@ -385,15 +303,12 @@ def styled_header(title, icon):
     """, unsafe_allow_html=True)
 
 def main():
-    # Page configuration
     st.set_page_config(
         page_title="AI Compliance Analyzer Pro",
         page_icon="🔍",
         layout="wide",
         initial_sidebar_state="expanded"
     )
-
-    # Replace the contract-card CSS with this:
 
     st.markdown("""
     <style>
@@ -446,18 +361,18 @@ def main():
         border: 1px solid #dee2e6;
         box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
         transition: all 0.3s ease;
-        color: #212529 !important; /* Force dark text color */
+        color: #212529 !important;
     }
     .contract-card:hover {
         box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
         transform: translateY(-2px);
     }
     .contract-card strong {
-        color: #212529 !important; /* Dark color for strong text */
+        color: #212529 !important;
         font-size: 1rem;
     }
     .contract-card small {
-        color: #6c757d !important; /* Gray color for small text */
+        color: #6c757d !important;
     }
     .compliance-card {
         background: linear-gradient(135deg, #d4fc79 0%, #96e6a1 100%);
@@ -474,7 +389,6 @@ def main():
         margin: 1rem 0;
         color: white;
     }
-    /* Highlight selected contract */
     .contract-card.selected {
         border-left: 6px solid #28a745;
         background: linear-gradient(135deg, #e8f5e8 0%, #d1e7dd 100%);
@@ -485,26 +399,39 @@ def main():
     .contract-card.selected small {
         color: #0f5132 !important;
     }
+    .analysis-result {
+        background: white;
+        border-radius: 10px;
+        padding: 2rem;
+        margin: 1rem 0;
+        border: 1px solid #dee2e6;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        color: #212529 !important;
+    }
+    .analysis-result h1, .analysis-result h2, .analysis-result h3, .analysis-result h4, .analysis-result h5, .analysis-result h6 {
+        color: #212529 !important;
+    }
+    .analysis-result p, .analysis-result li, .analysis-result div {
+        color: #212529 !important;
+    }
+    .analysis-result strong {
+        color: #212529 !important;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-    # Initialize AstraDB
     astra_vector_store, embeddings = init_astra()
 
-    # Initialize Groq
     groq_api_key = get_groq_api()
     llm = init_llm(groq_api_key) if groq_api_key else None
 
-    # Initialize contract storage
     if 'contract_storage' not in st.session_state:
         st.session_state.contract_storage = ContractStorage()
 
-    # Sidebar
     with st.sidebar:
         st.title("🔍 AI Compliance Analyzer Pro")
         st.markdown("---")
 
-        # Status indicators
         st.subheader("🔧 System Status")
 
         col1, col2 = st.columns(2)
@@ -532,33 +459,27 @@ def main():
 
         st.markdown("---")
 
-        # Navigation
         page = st.radio("Navigate to", [
             "🏠 Dashboard",
             "📥 Upload Compliance Docs",
             "📄 Upload & Analyze Contracts"
         ])
 
-        # Document count in sidebar
         st.markdown("---")
         contract_count = len(st.session_state.contract_storage.get_all_contracts())
-        
+
         col1, col2 = st.columns(2)
         with col1:
-            if astra_vector_store:
-                try:
-                    sample_docs = astra_vector_store.similarity_search("", k=10)
-                    doc_count = len(sample_docs)
-                except:
-                    doc_count = 0
-                st.metric("Compliance Docs", doc_count)
+            feedback = st.text_area("💬 Feedback", placeholder="Share your feedback...", height=80)
+            if st.button("Submit Feedback", use_container_width=True):
+                if feedback.strip():
+                    st.success("✅ Thank you for your feedback!")
             else:
-                st.metric("Compliance Docs", 0)
-            
+                st.warning("⚠️ Please enter your feedback")
+
         with col2:
             st.metric("Contracts", contract_count)
 
-        # Show stored contracts
         if contract_count > 0:
             st.subheader("📋 Stored Contracts")
             contracts = st.session_state.contract_storage.get_all_contracts()
@@ -570,7 +491,6 @@ def main():
                 </div>
                 """, unsafe_allow_html=True)
 
-    # Main content based on selected page
     if page == "🏠 Dashboard":
         render_dashboard(astra_vector_store, llm)
     elif page == "📥 Upload Compliance Docs":
@@ -613,32 +533,31 @@ def render_dashboard(astra_vector_store, llm):
         st.markdown("""
         ### 📋 Smart Analysis Pipeline
 
-        🔍 **Clause Extraction**
-        - LLM-powered clause identification
-        - Comprehensive coverage
-        - Precise text extraction
+        🔍 **Comprehensive Analysis**
+        - Single-step complete analysis
+        - Full contract text processing
+        - Smart compliance document retrieval
+        - Complete risk assessment
+        - Rectified clause suggestions
 
-        🎯 **Smart Retrieval**
-        - Keyword-optimized search
-        - Relevant compliance matching
-        - Efficient vector queries
-
-        ⚖️ **Precise Analysis**
-        - Requirement-specific checking
-        - Risk-level assessment
+        ⚖️ **Detailed Reporting**
+        - Executive summary
+        - Key clauses identified
+        - Compliance violations
+        - Risk categorization
         - Actionable recommendations
         """)
 
     st.markdown("---")
     st.subheader("🚀 Quick Actions")
-    
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         if st.button("📥 Upload Compliance Docs", use_container_width=True):
             st.session_state.current_page = "📥 Upload Compliance Docs"
             st.rerun()
-    
+
     with col2:
         if st.button("📄 Upload & Analyze Contracts", use_container_width=True):
             st.session_state.current_page = "📄 Upload & Analyze Contracts"
@@ -662,7 +581,6 @@ def render_upload_compliance(astra_vector_store, embeddings):
         """, unsafe_allow_html=True)
         return
 
-    # Upload options for compliance docs
     upload_option = st.radio(
         "Select upload method for compliance documents:",
         ["PDF File", "URL", "Text File", "Direct Text Input"],
@@ -694,7 +612,7 @@ def render_upload_compliance(astra_vector_store, embeddings):
                 extracted_content = extract_from_txt(text_file)
             source_info = {"type": "TXT", "name": text_file.name}
 
-    else:  # Direct Text Input
+    else:
         direct_text = st.text_area(
             "Paste your compliance framework text:",
             height=200,
@@ -705,7 +623,6 @@ def render_upload_compliance(astra_vector_store, embeddings):
             extracted_content = direct_text
             source_info = {"type": "Direct Input", "name": "Compliance Framework"}
 
-    # Process extracted compliance content
     if extracted_content:
         st.markdown("""
         <div class="success-box">
@@ -713,12 +630,10 @@ def render_upload_compliance(astra_vector_store, embeddings):
         </div>
         """, unsafe_allow_html=True)
 
-        # Display preview
         with st.expander("📋 Compliance Content Preview", expanded=True):
             preview_text = extracted_content[:1500] + "..." if len(extracted_content) > 1500 else extracted_content
             st.text_area("Preview", preview_text, height=200, label_visibility="collapsed", key="compliance_preview")
 
-        # Store in database as compliance documents
         if st.button("💾 Store Compliance Documents", use_container_width=True, key="store_compliance"):
             with st.spinner("🔄 Processing and storing compliance framework..."):
                 chunk_count = process_text_for_astra(extracted_content, astra_vector_store, source_info, doc_type="compliance")
@@ -736,25 +651,23 @@ def render_upload_compliance(astra_vector_store, embeddings):
                 </div>
                 """, unsafe_allow_html=True)
 
-    # Show existing compliance documents
     st.markdown("---")
     st.subheader("📊 Stored Compliance Documents")
-    
-    try:
-        # Get sample compliance documents to show count
-        sample_docs = astra_vector_store.similarity_search("compliance", k=10)
-        if sample_docs:
-            st.markdown(f"""
-            <div class="success-box">
-            ✅ {len(sample_docs)} compliance documents available in AstraDB
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown("""
-            <div class="info-box">
-            ℹ️ No compliance documents stored yet. Upload compliance frameworks to get started.
-            </div>
-            """, unsafe_allow_html=True)
+
+    # try:
+    #     sample_docs = astra_vector_store.similarity_search("compliance", k=10)
+    #     if sample_docs:
+    #         st.markdown(f"""
+    #         <div class="success-box">
+    #         ✅ {len(sample_docs)} compliance documents available in AstraDB
+    #         </div>
+    #         """, unsafe_allow_html=True)
+    #     else:
+    #         st.markdown("""
+    #         <div class="info-box">
+    #         ℹ️ No compliance documents stored yet. Upload compliance frameworks to get started.
+    #         </div>
+    #         """, unsafe_allow_html=True)
     except Exception as e:
         st.markdown("""
         <div class="info-box">
@@ -767,14 +680,12 @@ def render_upload_analyze_contracts(astra_vector_store, llm):
 
     st.markdown("""
     ### 📄 Complete Contract Analysis Pipeline
-    Upload contracts and run automated clause extraction + compliance analysis in one seamless workflow.
+    Upload contracts and run automated comprehensive compliance analysis in one seamless workflow.
     """)
 
-    # Initialize session state for current contract
     if 'current_contract_id' not in st.session_state:
         st.session_state.current_contract_id = None
 
-    # Tab interface
     tab1, tab2 = st.tabs(["📥 Upload Contracts", "🔍 Smart Analysis"])
 
     with tab1:
@@ -785,8 +696,7 @@ def render_upload_analyze_contracts(astra_vector_store, llm):
 
 def render_contract_upload_tab():
     st.subheader("📥 Upload Contract Documents")
-    
-    # Upload options for contracts
+
     upload_option = st.radio(
         "Select upload method:",
         ["PDF File", "URL", "Text File", "Direct Text Input"],
@@ -819,7 +729,7 @@ def render_contract_upload_tab():
                 extracted_content = extract_from_txt(text_file)
             source_info = {"type": "TXT", "name": text_file.name}
 
-    else:  # Direct Text Input
+    else:
         direct_text = st.text_area(
             "Paste your contract text:",
             height=200,
@@ -830,7 +740,6 @@ def render_contract_upload_tab():
             extracted_content = direct_text
             source_info = {"type": "Direct Input", "name": "Contract Document"}
 
-    # Process extracted contract content
     if extracted_content:
         st.markdown("""
         <div class="success-box">
@@ -838,12 +747,10 @@ def render_contract_upload_tab():
         </div>
         """, unsafe_allow_html=True)
 
-        # Display preview
         with st.expander("📋 Contract Content Preview", expanded=True):
             preview_text = extracted_content[:1500] + "..." if len(extracted_content) > 1500 else extracted_content
             st.text_area("Preview", preview_text, height=200, label_visibility="collapsed", key="contract_preview")
 
-        # Store in local storage
         if st.button("💾 Save Contract to Storage", use_container_width=True, key="store_contract"):
             contract_id = st.session_state.contract_storage.save_contract(extracted_content, source_info)
             st.session_state.current_contract_id = contract_id
@@ -854,10 +761,9 @@ def render_contract_upload_tab():
             """, unsafe_allow_html=True)
             st.rerun()
 
-    # Display stored contracts
     st.markdown("---")
     st.subheader("📋 Stored Contracts")
-    
+
     contracts = st.session_state.contract_storage.get_all_contracts()
     if not contracts:
         st.markdown("""
@@ -894,7 +800,7 @@ def render_contract_upload_tab():
 
 def render_smart_analysis_tab(astra_vector_store, llm):
     st.subheader("🔍 Smart Contract Analysis")
-    
+
     if not llm:
         st.markdown("""
         <div class="error-box">
@@ -912,7 +818,6 @@ def render_smart_analysis_tab(astra_vector_store, llm):
         """, unsafe_allow_html=True)
         return
 
-    # Check if compliance documents are available
     try:
         sample_compliance = astra_vector_store.similarity_search("compliance", k=1)
         has_compliance_docs = len(sample_compliance) > 0
@@ -930,7 +835,6 @@ def render_smart_analysis_tab(astra_vector_store, llm):
             st.rerun()
         return
 
-    # Contract selection
     contract_names = {cid: data['name'] for cid, data in contracts.items()}
     selected_contract_id = st.selectbox(
         "Select contract for analysis:",
@@ -945,17 +849,16 @@ def render_smart_analysis_tab(astra_vector_store, llm):
 
         st.markdown(f"""
         <div class="success-box">
-        ✅ Selected contract: **{contract_data['name']}**
+        ✅ Selected contract: **{contract_data['name']}** | Characters: {len(contract_text)}
         </div>
         """, unsafe_allow_html=True)
 
-        # Regulatory framework selection
         st.subheader("🎯 Select Regulatory Frameworks")
         regulatory_focus = st.multiselect(
             "Choose frameworks to analyze against:",
             [
                 "GDPR - Data Protection",
-                "HIPAA - Healthcare Privacy", 
+                "HIPAA - Healthcare Privacy",
                 "SOX - Financial Controls",
                 "CCPA - Consumer Privacy",
                 "PCI DSS - Payment Security",
@@ -964,7 +867,7 @@ def render_smart_analysis_tab(astra_vector_store, llm):
             default=["GDPR - Data Protection", "General Compliance"]
         )
 
-        if st.button("🚀 Run Complete Analysis", use_container_width=True, type="primary"):
+        if st.button("🚀 Run Comprehensive Analysis", use_container_width=True, type="primary"):
             if not regulatory_focus:
                 st.markdown("""
                 <div class="error-box">
@@ -973,92 +876,75 @@ def render_smart_analysis_tab(astra_vector_store, llm):
                 """, unsafe_allow_html=True)
                 return
 
-            # Create progress tracking
             progress_bar = st.progress(0)
             status_text = st.empty()
 
             try:
-                # Step 1: Extract clauses and keywords
-                status_text.text("🔍 Step 1/3: Extracting key clauses and compliance keywords...")
-                clauses_text, keywords = extract_clauses_and_keywords(contract_text, llm)
-                progress_bar.progress(33)
+                status_text.text("📚 Step 1/2: Retrieving relevant compliance documents...")
+                compliance_docs = retrieve_compliance_docs(contract_text, astra_vector_store, regulatory_focus)
+                progress_bar.progress(50)
 
-                # Display extracted clauses and keywords
-                with st.expander("📋 Extracted Clauses & Keywords", expanded=True):
-                    st.subheader("Key Clauses Found:")
-                    st.write(clauses_text)
-                    
-                    st.subheader("Compliance Keywords for Search:")
-                    st.write(", ".join(keywords))
-
-                # Step 2: Retrieve relevant compliance documents
-                status_text.text("📚 Step 2/3: Retrieving relevant compliance documents...")
-                compliance_docs = retrieve_compliance_docs(keywords, astra_vector_store, llm)
-                progress_bar.progress(66)
-
-                # Display retrieved documents info
                 with st.expander("📚 Retrieved Compliance Documents", expanded=False):
                     if compliance_docs:
                         st.success(f"✅ Retrieved {len(compliance_docs)} relevant compliance documents")
-                        for i, doc in enumerate(compliance_docs[:3]):
+                        for i, doc in enumerate(compliance_docs[:5]):
                             st.markdown(f"**Document {i+1}** (Source: {doc.metadata.get('source_name', 'Unknown')})")
-                            st.text(doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content)
+                            st.text(doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content)
                     else:
                         st.warning("⚠️ No specific compliance documents retrieved")
 
-                # Step 3: Perform comprehensive analysis
-                status_text.text("⚖️ Step 3/3: Performing compliance analysis...")
-                analysis_result = analyze_compliance_comprehensive(
-                    contract_text, 
-                    clauses_text, 
-                    compliance_docs, 
-                    llm, 
+                status_text.text("⚖️ Step 2/2: Performing comprehensive compliance analysis...")
+                analysis_result = comprehensive_compliance_analysis(
+                    contract_text,
+                    compliance_docs,
+                    llm,
                     regulatory_focus
                 )
                 progress_bar.progress(100)
                 status_text.text("✅ Analysis Complete!")
 
-                # Display final results
                 st.markdown("---")
                 st.markdown("""
                 <div class="analysis-section">
-                    <h2 style="color: white; margin: 0;">Compliance Analysis Results</h2>
+                    <h2 style="color: white; margin: 0;">Comprehensive Compliance Analysis Results</h2>
                     <p style="color: white; margin: 0.5rem 0 0 0;">Complete assessment generated through smart pipeline</p>
                 </div>
                 """, unsafe_allow_html=True)
 
-                # Display the formatted analysis result
-                st.markdown(analysis_result)
+                st.markdown("""
+                <div class="analysis-result">
+                """ + analysis_result + """
+                </div>
+                """, unsafe_allow_html=True)
 
-                # Download comprehensive report
                 full_report = f"""
-COMPLETE COMPLIANCE ANALYSIS REPORT
+COMPREHENSIVE COMPLIANCE ANALYSIS REPORT
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Contract: {contract_data['name']}
 Frameworks: {', '.join(regulatory_focus)}
+Contract Length: {len(contract_text)} characters
 
-EXTRACTED CLAUSES:
-{clauses_text}
-
-COMPLIANCE ANALYSIS:
+ANALYSIS RESULTS:
 {analysis_result}
 
 ANALYSIS METHODOLOGY:
-- Clause Extraction: LLM-powered identification
-- Document Retrieval: Vector similarity search
-- Compliance Checking: Requirement-specific analysis
+- Single-step comprehensive analysis
+- Full contract text processing
+- Smart compliance document retrieval
+- Complete risk assessment
+- Rectified clause suggestions
                 """
 
                 st.download_button(
                     label="💾 Download Complete Analysis Report",
                     data=full_report,
-                    file_name=f"compliance_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    file_name=f"comprehensive_compliance_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
                     mime="text/plain",
                     use_container_width=True
                 )
 
             except Exception as e:
-                st.error(f"Error during analysis: {str(e)}")
+                st.error(f"Error during comprehensive analysis: {str(e)}")
                 progress_bar.empty()
                 status_text.empty()
 
